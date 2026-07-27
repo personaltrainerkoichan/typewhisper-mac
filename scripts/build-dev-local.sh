@@ -5,6 +5,7 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 derived_data_path="$repo_root/.build/DerivedData-Dev"
 install_dir="$HOME/Applications"
 installed_app="$install_dir/TypeWhisper-Dev.app"
+dev_bundle_id="com.typewhisper.mac.dev"
 lsregister="/System/Library/Frameworks/CoreServices.framework/Versions/Current/Frameworks/LaunchServices.framework/Versions/Current/Support/lsregister"
 
 log() {
@@ -95,6 +96,43 @@ write_build_marker() {
   } > "$marker"
 }
 
+# Building with CODE_SIGNING_ALLOWED=NO leaves only dyld's bare linker-applied
+# signature, whose identifier is the executable name ("TypeWhisper") rather than
+# the real bundle id.
+#
+# WHY A CERTIFICATE AND NOT AD-HOC ("-"):
+# macOS keys TCC grants (microphone, accessibility) to the app's designated
+# requirement. Ad-hoc signing yields `designated => cdhash H"..."` — a hash of the
+# built binary — so every rebuild looks like a brand-new app and the permission
+# has to be granted again. Signing with a certificate yields
+# `designated => identifier "com.typewhisper.mac.dev" and certificate leaf H"..."`,
+# which does not depend on the binary, so grants survive rebuilds.
+#
+# The identity is a self-signed Code Signing certificate in the login keychain.
+# It does not need to be trusted for codesign to use it.
+# See docs/dev-signing-identity.md to recreate it.
+sign_dev_app() {
+  local app="$1" identity item
+  identity="${TYPEWHISPER_DEV_SIGN_IDENTITY:-TypeWhisper Dev Self-Signed}"
+
+  if [[ "$identity" != "-" ]] && ! security find-certificate -c "$identity" >/dev/null 2>&1; then
+    log "warning: signing identity '$identity' not found in the keychain"
+    log "warning: falling back to ad-hoc signing; microphone and accessibility"
+    log "warning: permission will have to be re-granted after every build"
+    log "warning: see docs/dev-signing-identity.md to recreate it"
+    identity="-"
+  fi
+
+  while IFS= read -r -d '' item; do
+    codesign --force --sign "$identity" "$item"
+  done < <(find "$app/Contents/PlugIns" "$app/Contents/Frameworks" -maxdepth 1 \
+    \( -name '*.appex' -o -name '*.bundle' -o -name '*.framework' \) -print0 2>/dev/null)
+
+  codesign --force --sign "$identity" --identifier "$dev_bundle_id" "$app"
+  codesign --verify --deep --strict "$app"
+  log "signed with identity: $identity"
+}
+
 trash_stale_dev_apps() {
   local keep_app="$1"
   local search_roots=(
@@ -139,6 +177,16 @@ trash_if_present "$installed_app"
 ditto "$app_path" "$installed_app"
 write_build_marker "$installed_app"
 xattr -cr "$installed_app" >/dev/null 2>&1 || true
+
+# The dev build must never be able to pull the real release: strip Sparkle's feed
+# so "Check for Updates" cannot install the production app over the dev one.
+/usr/libexec/PlistBuddy -c "Delete :SUFeedURL" "$installed_app/Contents/Info.plist" 2>/dev/null || true
+for key in SUEnableAutomaticChecks SUAutomaticallyUpdate; do
+  /usr/libexec/PlistBuddy -c "Add :$key bool false" "$installed_app/Contents/Info.plist" 2>/dev/null \
+    || /usr/libexec/PlistBuddy -c "Set :$key false" "$installed_app/Contents/Info.plist"
+done
+
+sign_dev_app "$installed_app"
 
 trash_stale_dev_apps "$installed_app"
 
